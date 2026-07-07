@@ -1,1 +1,0 @@
-Allow build ``prim.c`` for Windows UWP.
