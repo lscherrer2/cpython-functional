@@ -41,6 +41,15 @@ PyCriticalSection_BeginMutex(PyCriticalSection *c, PyMutex *m);
 PyAPI_FUNC(void)
 PyCriticalSection2_BeginMutex(PyCriticalSection2 *c, PyMutex *m1, PyMutex *m2);
 
+// Attempts to enter a critical section locking both `a` and `b` without
+// blocking. Returns non-zero (1) if successful, in which case the critical
+// section is active and must be terminated with `PyCriticalSection2_End(c)`.
+// Returns 0 if acquiring the locks would block, in which case no locks are
+// acquired and the critical section is not entered. On GIL-enabled builds,
+// this always succeeds and returns 1.
+PyAPI_FUNC(int)
+PyCriticalSection2_TryBegin(PyCriticalSection2 *c, PyObject *a, PyObject *b);
+
 #ifndef Py_GIL_DISABLED
 #undef Py_BEGIN_CRITICAL_SECTION
 #undef Py_END_CRITICAL_SECTION
