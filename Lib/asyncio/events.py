@@ -661,6 +661,9 @@ class AbstractEventLoop:
     def set_debug(self, enabled):
         raise NotImplementedError
 
+    def crash(self, exception):
+        raise NotImplementedError
+
 
 class _Local(threading.local):
     _loop = None
