@@ -562,7 +562,7 @@ if _os.name == "nt":
     windll = LibraryLoader(WinDLL)
     oledll = LibraryLoader(OleDLL)
 
-    GetLastError = windll.kernel32.GetLastError
+    from _winapi import GetLastError
     from _ctypes import get_last_error, set_last_error
 
     def WinError(code=None, descr=None):
