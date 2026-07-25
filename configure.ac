@@ -2404,11 +2404,7 @@ then
 	case $ac_sys_system in
 	    SCO_SV*) OPT="$OPT -m486 -DSCO5"
 	    ;;
-        esac
-	;;
-
-    *)
-	OPT="-O"
+  esac
 	;;
     esac
 fi
