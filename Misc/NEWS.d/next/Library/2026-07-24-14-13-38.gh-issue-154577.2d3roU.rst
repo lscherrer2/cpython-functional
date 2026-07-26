@@ -1,0 +1,2 @@
+Fix data race of :c:type:`MultibyteIncrementalEncoderObject` and
+:c:type:`MultibyteIncrementalDecoderObject`
