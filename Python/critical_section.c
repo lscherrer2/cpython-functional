@@ -217,3 +217,14 @@ PyCriticalSection2_End(PyCriticalSection2 *c)
     _PyCriticalSection2_End(_PyThreadState_GET(), c);
 #endif
 }
+
+#undef PyCriticalSection2_TryBegin
+int
+PyCriticalSection2_TryBegin(PyCriticalSection2 *c, PyObject *a, PyObject *b)
+{
+#ifdef Py_GIL_DISABLED
+    return _PyCriticalSection2_TryBegin(_PyThreadState_GET(), c, a, b);
+#else
+    return 1;
+#endif
+}

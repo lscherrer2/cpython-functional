@@ -1457,9 +1457,18 @@ _Py_Specialize_LoadGlobal(
     PyObject *globals, PyObject *builtins,
     _Py_CODEUNIT *instr, PyObject *name)
 {
-    Py_BEGIN_CRITICAL_SECTION2(globals, builtins);
+#ifdef Py_GIL_DISABLED
+    PyCriticalSection2 cs;
+    if (PyCriticalSection2_TryBegin(&cs, globals, builtins)) {
+        specialize_load_global_lock_held(globals, builtins, instr, name);
+        PyCriticalSection2_End(&cs);
+    }
+    else {
+        unspecialize(instr);
+    }
+#else
     specialize_load_global_lock_held(globals, builtins, instr, name);
-    Py_END_CRITICAL_SECTION2();
+#endif
 }
 
 static int

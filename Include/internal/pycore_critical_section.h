@@ -193,6 +193,60 @@ _PyCriticalSection2_Begin(PyThreadState *tstate, PyCriticalSection2 *c, PyObject
     _PyCriticalSection2_BeginMutex(tstate, c, &a->ob_mutex, &b->ob_mutex);
 }
 
+static inline int
+_PyCriticalSection_TryBeginMutex(PyThreadState *tstate, PyCriticalSection *c, PyMutex *m)
+{
+    if (PyMutex_LockFast(m)) {
+        c->_cs_mutex = m;
+        c->_cs_prev = tstate->critical_section;
+        tstate->critical_section = (uintptr_t)c;
+        return 1;
+    }
+    return 0;
+}
+
+static inline int
+_PyCriticalSection2_TryBeginMutex(PyThreadState *tstate, PyCriticalSection2 *c, PyMutex *m1, PyMutex *m2)
+{
+    if (m1 == m2) {
+        c->_cs_mutex2 = NULL;
+        return _PyCriticalSection_TryBeginMutex(tstate, &c->_cs_base, m1);
+    }
+
+    if ((uintptr_t)m2 < (uintptr_t)m1) {
+        PyMutex *tmp = m1;
+        m1 = m2;
+        m2 = tmp;
+    }
+
+    if (PyMutex_LockFast(m1)) {
+        if (PyMutex_LockFast(m2)) {
+            c->_cs_base._cs_mutex = m1;
+            c->_cs_mutex2 = m2;
+            c->_cs_base._cs_prev = tstate->critical_section;
+
+            uintptr_t p = (uintptr_t)c | _Py_CRITICAL_SECTION_TWO_MUTEXES;
+            tstate->critical_section = p;
+            return 1;
+        }
+        else {
+            PyMutex_Unlock(m1);
+            return 0;
+        }
+    }
+    return 0;
+}
+
+// Attempts to enter a two-object critical section without blocking.
+// Returns 1 if both mutexes were locked immediately, in which case the
+// critical section is entered and must be exited with `_PyCriticalSection2_End`.
+// Returns 0 if locking would block, leaving no locks held.
+static inline int
+_PyCriticalSection2_TryBegin(PyThreadState *tstate, PyCriticalSection2 *c, PyObject *a, PyObject *b)
+{
+    return _PyCriticalSection2_TryBeginMutex(tstate, c, &a->ob_mutex, &b->ob_mutex);
+}
+
 static inline void
 _PyCriticalSection2_End(PyThreadState *tstate, PyCriticalSection2 *c)
 {
