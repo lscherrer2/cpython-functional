@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import types
 import unittest
 
@@ -23,6 +24,42 @@ if not sysconfig.get_config_var('WITH_DTRACE'):
 
 def abspath(filename):
     return os.path.abspath(findfile(filename, subdir="dtracedata"))
+
+
+def get_probe_binary():
+    binary = sys.executable
+    if sysconfig.get_config_var("Py_ENABLE_SHARED"):
+        lib_dir = sysconfig.get_config_var("LIBDIR")
+        if not lib_dir or sysconfig.is_python_build():
+            lib_dir = os.path.abspath(os.path.dirname(sys.executable))
+
+        lib_names = []
+        for name in (
+            sysconfig.get_config_var("INSTSONAME"),
+            sysconfig.get_config_var("LDLIBRARY"),
+        ):
+            if name and name not in lib_names:
+                lib_names.append(name)
+
+        if lib_dir:
+            for name in lib_names:
+                libpython_path = os.path.join(lib_dir, name)
+                if os.path.exists(libpython_path):
+                    binary = libpython_path
+                    break
+
+    return binary
+
+
+def truncate_output(output, *, max_lines=3, max_chars=500):
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    omitted = len(lines) - max_lines
+    output = "; ".join(lines[:max_lines])
+    if omitted > 0:
+        output += f"; ... ({omitted} lines omitted)"
+    if len(output) > max_chars:
+        output = output[:max_chars - 3] + "..."
+    return output
 
 
 def normalize_trace_output(output):
@@ -95,7 +132,8 @@ def run_readelf(cmd):
         raise AssertionError(
             f"Command {shlex.join(cmd)!r} failed "
             f"with exit code {proc.returncode}: "
-            f"stdout={stdout!r} stderr={stderr!r}"
+            f"stdout={truncate_output(stdout)!r} "
+            f"stderr={truncate_output(stderr)!r}"
         )
 
     return stdout
@@ -141,7 +179,8 @@ class TraceBackend:
         if check_returncode and proc.returncode:
             raise AssertionError(
                 f"Command {shlex.join(command)!r} failed "
-                f"with exit code {proc.returncode}: output={stdout!r}"
+                f"with exit code {proc.returncode}: "
+                f"output={truncate_output(stdout)!r}"
             )
         return stdout
 
@@ -166,7 +205,9 @@ class TraceBackend:
             output = str(fnfe)
         if output != "probe: success":
             raise unittest.SkipTest(
-                "{}(1) failed: {}".format(self.COMMAND[0], output)
+                "{}(1) failed: {}".format(
+                    self.COMMAND[0], truncate_output(output)
+                )
             )
 
 
@@ -180,6 +221,43 @@ class DTraceBackend(TraceBackend):
 class SystemTapBackend(TraceBackend):
     EXTENSION = ".stp"
     COMMAND = ["stap", "-g"]
+    PROBE_PLACEHOLDER = "@PYTHON_SYSTEMTAP_PROBE@"
+
+    @staticmethod
+    def _quote_systemtap_string(value):
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    def _python_probe(self):
+        executable = self._quote_systemtap_string(sys.executable)
+        probe_binary = get_probe_binary()
+        if probe_binary != sys.executable:
+            probe_binary = self._quote_systemtap_string(probe_binary)
+            return f'process("{executable}").library("{probe_binary}").mark'
+        return f'process("{executable}").mark'
+
+    def _render_script(self, script_file):
+        with open(script_file) as script:
+            return script.read().replace(
+                self.PROBE_PLACEHOLDER, self._python_probe()
+            )
+
+    def trace(self, script_file, subcommand=None, *, timeout=None,
+              check_returncode=False):
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", suffix=self.EXTENSION, delete=False
+        ) as script:
+            script.write(self._render_script(script_file))
+            generated_script_file = script.name
+
+        try:
+            return super().trace(
+                generated_script_file,
+                subcommand,
+                timeout=timeout,
+                check_returncode=check_returncode,
+            )
+        finally:
+            os.unlink(generated_script_file)
 
 
 class BPFTraceBackend(TraceBackend):
@@ -273,7 +351,7 @@ gc__done:1""",
             python_flags.extend(["-O"] * optimize_python)
 
         subcommand = [sys.executable] + python_flags + [python_file]
-        program = self.PROGRAMS[name].format(python=sys.executable)
+        program = self.PROGRAMS[name].format(python=get_probe_binary())
 
         try:
             proc = create_process_group(
@@ -291,7 +369,8 @@ gc__done:1""",
 
         if proc.returncode != 0:
             raise AssertionError(
-                f"bpftrace failed with code {proc.returncode}:\n{stderr}"
+                f"bpftrace failed with code {proc.returncode}: "
+                f"{truncate_output(stderr)}"
             )
 
         stdout = self._filter_probe_rows(stdout)
@@ -312,7 +391,7 @@ gc__done:1""",
 
     def assert_usable(self):
         # Check if bpftrace is available and can attach to USDT probes
-        program = f'usdt:{sys.executable}:python:function__entry {{ printf("probe: success\\n"); exit(); }}'
+        program = f'usdt:{get_probe_binary()}:python:function__entry {{ printf("probe: success\\n"); exit(); }}'
         try:
             proc = create_process_group(
                 ["bpftrace", "-e", program, "-c",
@@ -331,12 +410,15 @@ gc__done:1""",
         # Check for permission errors (bpftrace usually requires root)
         if proc.returncode != 0:
             raise unittest.SkipTest(
-                f"bpftrace(1) failed with code {proc.returncode}: {stderr}"
+                f"bpftrace(1) failed with code {proc.returncode}: "
+                f"{truncate_output(stderr)}"
             )
 
         if "probe: success" not in stdout:
             raise unittest.SkipTest(
-                f"bpftrace(1) failed: stdout={stdout!r} stderr={stderr!r}"
+                f"bpftrace(1) failed: "
+                f"stdout={truncate_output(stdout)!r} "
+                f"stderr={truncate_output(stderr)!r}"
             )
 
 
@@ -455,28 +537,7 @@ class CheckDtraceProbes(unittest.TestCase):
         return int(match.group(1)), int(match.group(2))
 
     def get_readelf_output(self):
-        binary = sys.executable
-        if sysconfig.get_config_var("Py_ENABLE_SHARED"):
-            lib_dir = sysconfig.get_config_var("LIBDIR")
-            if not lib_dir or sysconfig.is_python_build():
-                lib_dir = os.path.abspath(os.path.dirname(sys.executable))
-
-            lib_names = []
-            for name in (
-                sysconfig.get_config_var("INSTSONAME"),
-                sysconfig.get_config_var("LDLIBRARY"),
-            ):
-                if name and name not in lib_names:
-                    lib_names.append(name)
-
-            if lib_dir:
-                for name in lib_names:
-                    libpython_path = os.path.join(lib_dir, name)
-                    if os.path.exists(libpython_path):
-                        binary = libpython_path
-                        break
-
-        return run_readelf(["readelf", "-n", binary])
+        return run_readelf(["readelf", "-n", get_probe_binary()])
 
     def test_check_probes(self):
         readelf_output = self.get_readelf_output()
