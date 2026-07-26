@@ -47,7 +47,8 @@ static PyContext *
 context_new_empty(void);
 
 static PyContext *
-context_new_from_vars(PyHamtObject *vars);
+context_new_from_vars(PyHamtObject *vars,
+                      PyHamtObject *thread_inheritable_vars);
 
 static inline PyContext *
 context_get(void);
@@ -56,7 +57,7 @@ static PyContextToken *
 token_new(PyContext *ctx, PyContextVar *var, PyObject *val);
 
 static PyContextVar *
-contextvar_new(PyObject *name, PyObject *def);
+contextvar_new(PyObject *name, PyObject *def, int thread_inheritable);
 
 static int
 contextvar_set(PyContextVar *var, PyObject *val);
@@ -80,11 +81,28 @@ PyContext_New(void)
 
 
 PyObject *
+_PyContext_NewThreadStartContext(void)
+{
+    PyContext *ctx = context_get();
+    if (ctx == NULL) {
+        return NULL;
+    }
+
+    // The thread-inheritable subset becomes the new context's full vars map.
+    // Every entry in it is thread-inheritable, so it is also its own subset.
+    return (PyObject *)context_new_from_vars(
+        ctx->ctx_thread_inheritable_vars,
+        ctx->ctx_thread_inheritable_vars);
+}
+
+
+PyObject *
 PyContext_Copy(PyObject * octx)
 {
     ENSURE_Context(octx, NULL)
     PyContext *ctx = (PyContext *)octx;
-    return (PyObject *)context_new_from_vars(ctx->ctx_vars);
+    return (PyObject *)context_new_from_vars(
+        ctx->ctx_vars, ctx->ctx_thread_inheritable_vars);
 }
 
 
@@ -96,7 +114,8 @@ PyContext_CopyCurrent(void)
         return NULL;
     }
 
-    return (PyObject *)context_new_from_vars(ctx->ctx_vars);
+    return (PyObject *)context_new_from_vars(
+        ctx->ctx_vars, ctx->ctx_thread_inheritable_vars);
 }
 
 static const char *
@@ -262,16 +281,29 @@ PyContext_Exit(PyObject *octx)
 }
 
 
-PyObject *
-PyContextVar_New(const char *name, PyObject *def)
+static PyObject *
+contextvar_new_from_utf8(const char *name, PyObject *def,
+                         int thread_inheritable)
 {
     PyObject *pyname = PyUnicode_FromString(name);
     if (pyname == NULL) {
         return NULL;
     }
-    PyContextVar *var = contextvar_new(pyname, def);
+    PyContextVar *var = contextvar_new(pyname, def, thread_inheritable);
     Py_DECREF(pyname);
     return (PyObject *)var;
+}
+
+PyObject *
+PyContextVar_New(const char *name, PyObject *def)
+{
+    return contextvar_new_from_utf8(name, def, 0);
+}
+
+PyObject *
+PyContextVar_NewThreadInheritable(const char *name, PyObject *def)
+{
+    return contextvar_new_from_utf8(name, def, 1);
 }
 
 
@@ -437,6 +469,7 @@ _context_alloc(void)
 
     ctx->ctx_vars = NULL;
     ctx->ctx_prev = NULL;
+    ctx->ctx_thread_inheritable_vars = NULL;
     ctx->ctx_entered = 0;
     ctx->ctx_weakreflist = NULL;
 
@@ -458,13 +491,20 @@ context_new_empty(void)
         return NULL;
     }
 
+    ctx->ctx_thread_inheritable_vars = _PyHamt_New();
+    if (ctx->ctx_thread_inheritable_vars == NULL) {
+        Py_DECREF(ctx);
+        return NULL;
+    }
+
     _PyObject_GC_TRACK(ctx);
     return ctx;
 }
 
 
 static PyContext *
-context_new_from_vars(PyHamtObject *vars)
+context_new_from_vars(PyHamtObject *vars,
+                      PyHamtObject *thread_inheritable_vars)
 {
     PyContext *ctx = _context_alloc();
     if (ctx == NULL) {
@@ -472,6 +512,8 @@ context_new_from_vars(PyHamtObject *vars)
     }
 
     ctx->ctx_vars = (PyHamtObject*)Py_NewRef(vars);
+    ctx->ctx_thread_inheritable_vars =
+        (PyHamtObject*)Py_NewRef(thread_inheritable_vars);
 
     _PyObject_GC_TRACK(ctx);
     return ctx;
@@ -523,6 +565,7 @@ context_tp_clear(PyObject *op)
     PyContext *self = _PyContext_CAST(op);
     Py_CLEAR(self->ctx_prev);
     Py_CLEAR(self->ctx_vars);
+    Py_CLEAR(self->ctx_thread_inheritable_vars);
     return 0;
 }
 
@@ -532,6 +575,7 @@ context_tp_traverse(PyObject *op, visitproc visit, void *arg)
     PyContext *self = _PyContext_CAST(op);
     Py_VISIT(self->ctx_prev);
     Py_VISIT(self->ctx_vars);
+    Py_VISIT(self->ctx_thread_inheritable_vars);
     return 0;
 }
 
@@ -708,7 +752,8 @@ static PyObject *
 _contextvars_Context_copy_impl(PyContext *self)
 /*[clinic end generated code: output=30ba8896c4707a15 input=ebafdbdd9c72d592]*/
 {
-    return (PyObject *)context_new_from_vars(self->ctx_vars);
+    return (PyObject *)context_new_from_vars(
+        self->ctx_vars, self->ctx_thread_inheritable_vars);
 }
 
 
@@ -801,7 +846,23 @@ contextvar_set(PyContextVar *var, PyObject *val)
         return -1;
     }
 
+    // Compute both new maps before installing either so that an error
+    // leaves the context unchanged.
+    PyHamtObject *new_thread_inheritable_vars = NULL;
+    if (var->var_thread_inheritable) {
+        new_thread_inheritable_vars = _PyHamt_Assoc(
+            ctx->ctx_thread_inheritable_vars, (PyObject *)var, val);
+        if (new_thread_inheritable_vars == NULL) {
+            Py_DECREF(new_vars);
+            return -1;
+        }
+    }
+
     Py_SETREF(ctx->ctx_vars, new_vars);
+    if (new_thread_inheritable_vars != NULL) {
+        Py_SETREF(ctx->ctx_thread_inheritable_vars,
+                  new_thread_inheritable_vars);
+    }
 
 #ifndef Py_GIL_DISABLED
     var->var_cached = val;  /* borrow */
@@ -835,7 +896,23 @@ contextvar_del(PyContextVar *var)
         return -1;
     }
 
+    // Compute both new maps before installing either so that an error
+    // leaves the context unchanged.
+    PyHamtObject *new_thread_inheritable_vars = NULL;
+    if (var->var_thread_inheritable) {
+        new_thread_inheritable_vars = _PyHamt_Without(
+            ctx->ctx_thread_inheritable_vars, (PyObject *)var);
+        if (new_thread_inheritable_vars == NULL) {
+            Py_DECREF(new_vars);
+            return -1;
+        }
+    }
+
     Py_SETREF(ctx->ctx_vars, new_vars);
+    if (new_thread_inheritable_vars != NULL) {
+        Py_SETREF(ctx->ctx_thread_inheritable_vars,
+                  new_thread_inheritable_vars);
+    }
     return 0;
 }
 
@@ -868,7 +945,7 @@ contextvar_generate_hash(void *addr, PyObject *name)
 }
 
 static PyContextVar *
-contextvar_new(PyObject *name, PyObject *def)
+contextvar_new(PyObject *name, PyObject *def, int thread_inheritable)
 {
     if (!PyUnicode_Check(name)) {
         PyErr_SetString(PyExc_TypeError,
@@ -883,6 +960,7 @@ contextvar_new(PyObject *name, PyObject *def)
 
     var->var_name = Py_NewRef(name);
     var->var_default = Py_XNewRef(def);
+    var->var_thread_inheritable = thread_inheritable;
 
 #ifndef Py_GIL_DISABLED
     var->var_cached = NULL;
@@ -927,7 +1005,7 @@ contextvar_tp_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    return (PyObject *)contextvar_new(name, def);
+    return (PyObject *)contextvar_new(name, def, 0);
 }
 
 static int
@@ -1006,6 +1084,32 @@ contextvar_tp_repr(PyObject *op)
 error:
     PyUnicodeWriter_Discard(writer);
     return NULL;
+}
+
+
+/*[clinic input]
+@classmethod
+_contextvars.ContextVar.thread_inheritable
+    name: object
+    /
+    *
+    default: object = NULL
+
+Create a context variable whose binding is inherited by new threads.
+
+The bindings of such variables are copied into the context of a new
+thread by threading.Thread.start() when the thread would otherwise
+start with an empty context.
+[clinic start generated code]*/
+
+static PyObject *
+_contextvars_ContextVar_thread_inheritable_impl(PyTypeObject *type,
+                                                PyObject *name,
+                                                PyObject *default_value)
+/*[clinic end generated code: output=a890265ff610a979 input=f211f3eedeb507b8]*/
+{
+    assert(type == &PyContextVar_Type);
+    return (PyObject *)contextvar_new(name, default_value, 1);
 }
 
 
@@ -1099,6 +1203,7 @@ static PyMemberDef PyContextVar_members[] = {
 };
 
 static PyMethodDef PyContextVar_methods[] = {
+    _CONTEXTVARS_CONTEXTVAR_THREAD_INHERITABLE_METHODDEF
     _CONTEXTVARS_CONTEXTVAR_GET_METHODDEF
     _CONTEXTVARS_CONTEXTVAR_SET_METHODDEF
     _CONTEXTVARS_CONTEXTVAR_RESET_METHODDEF
