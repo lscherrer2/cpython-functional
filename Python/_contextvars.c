@@ -1,4 +1,5 @@
 #include "Python.h"
+#include "pycore_context.h"      // _PyContext_*()
 
 #include "clinic/_contextvars.c.h"
 
@@ -20,10 +21,36 @@ _contextvars_copy_context_impl(PyObject *module)
 }
 
 
+/*[clinic input]
+_contextvars._thread_start_context
+[clinic start generated code]*/
+
+static PyObject *
+_contextvars__thread_start_context_impl(PyObject *module)
+/*[clinic end generated code: output=7e656d156c385a65 input=4575c5d2223de58d]*/
+{
+    return _PyContext_NewForThread();
+}
+
+
+/* Return the depth of the current context (see _pycontextobject.ctx_depth).
+   Used by the pure-Python decimal implementation to detect when a context
+   object was inherited from an outer context/task.  Private API. */
+static PyObject *
+_contextvars_current_context_depth(PyObject *module,
+                                   PyObject *Py_UNUSED(ignored))
+{
+    return PyLong_FromUnsignedLongLong(_PyContext_CurrentDepth());
+}
+
+
 PyDoc_STRVAR(module_doc, "Context Variables");
 
 static PyMethodDef _contextvars_methods[] = {
     _CONTEXTVARS_COPY_CONTEXT_METHODDEF
+    _CONTEXTVARS__THREAD_START_CONTEXT_METHODDEF
+    {"_current_context_depth", _contextvars_current_context_depth,
+     METH_NOARGS, NULL},
     {NULL, NULL}
 };
 

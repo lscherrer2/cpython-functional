@@ -539,11 +539,23 @@ since it is impossible to detect the termination of alien threads.
    the thread.  The default value is ``None`` which indicates that the
    :data:`sys.flags.thread_inherit_context` flag controls the behaviour.  If
    the flag is true, threads will start with a copy of the context of the
-   caller of :meth:`~Thread.start`.  If false, they will start with an empty
-   context.  To explicitly start with an empty context, pass a new instance of
+   caller of :meth:`~Thread.start`.  If false, they will start with a
+   context containing only the caller's current bindings for context variables
+   created by :meth:`~contextvars.ContextVar.thread_inheritable`.  To explicitly
+   start with an empty context, pass a new instance of
    :class:`~contextvars.Context()`.  To explicitly start with a copy of the
    current context, pass the value from :func:`~contextvars.copy_context`. The
    flag defaults true on free-threaded builds and false otherwise.
+
+   On GIL-enabled builds, when the flag has its default value of false and
+   *context* is ``None``, looking up a context variable that was set in the
+   caller of :meth:`~Thread.start` but is absent from the new thread's context
+   emits a :exc:`DeprecationWarning`.  In a future release, the flag will
+   default to true on all builds, so threads will inherit context by default.
+   Set
+   :option:`-X thread_inherit_context <-X>` or
+   :envvar:`PYTHON_THREAD_INHERIT_CONTEXT`, or pass an explicit *context*, to
+   select the behavior now and suppress this warning.
 
    If the subclass overrides the constructor, it must make sure to invoke the
    base class constructor (``Thread.__init__()``) before doing anything else to

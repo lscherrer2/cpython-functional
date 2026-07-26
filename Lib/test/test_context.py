@@ -4,17 +4,29 @@ import concurrent.futures
 import contextvars
 import functools
 import gc
+import os
 import random
 import time
 import unittest
+import warnings
 import weakref
 from test import support
-from test.support import threading_helper
+from test.support import script_helper, threading_helper
 
 try:
     from _testinternalcapi import hamt
 except ImportError:
     hamt = None
+
+
+THREAD_INHERIT_CONTEXT_WARNING = (
+    not support.Py_GIL_DISABLED
+    and not sys.flags.thread_inherit_context
+    and "thread_inherit_context" not in sys._xoptions
+    and (sys.flags.ignore_environment
+         # An empty value is treated as unset, as in Python/initconfig.c.
+         or not os.environ.get("PYTHON_THREAD_INHERIT_CONTEXT"))
+)
 
 
 def isolated_context(func):
@@ -40,7 +52,46 @@ class ContextTest(unittest.TestCase):
         with self.assertRaises(AttributeError):
             c.name = 'bbb'
 
+        inheritable = contextvars.ContextVar.thread_inheritable('inheritable')
+        self.assertIs(type(inheritable), contextvars.ContextVar)
+        self.assertEqual(inheritable.name, 'inheritable')
+
+        inheritable_with_default = (
+            contextvars.ContextVar.thread_inheritable(
+                'inheritable_with_default', default=42,
+            )
+        )
+        self.assertEqual(inheritable_with_default.get(), 42)
+
+        with self.assertRaisesRegex(TypeError, 'must be a str'):
+            contextvars.ContextVar.thread_inheritable(1)
+        with self.assertRaises(TypeError):
+            contextvars.ContextVar.thread_inheritable('var', None)
+        with self.assertRaises(TypeError):
+            contextvars.ContextVar('var', inherit=True)
+
         self.assertNotEqual(hash(c), hash('aaa'))
+
+    def test_thread_inheritable_context_var_gc(self):
+        class Value:
+            pass
+
+        def make_cycle():
+            var = contextvars.ContextVar.thread_inheritable('var')
+            ctx = contextvars.Context()
+            value = Value()
+            value_ref = weakref.ref(value)
+
+            def bind():
+                var.set(value)
+                value.context = contextvars.copy_context()
+
+            ctx.run(bind)
+            return value_ref
+
+        value_ref = make_cycle()
+        support.gc_collect()
+        self.assertIsNone(value_ref())
 
     @isolated_context
     def test_context_var_repr_1(self):
@@ -400,12 +451,12 @@ class ContextTest(unittest.TestCase):
 
         cvar = contextvars.ContextVar('cvar')
 
+        results = []
+
         def run_context_none():
-            if sys.flags.thread_inherit_context:
-                expected = 1
-            else:
-                expected = None
-            self.assertEqual(cvar.get(None), expected)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", DeprecationWarning)
+                results.append((cvar.get(None), len(caught)))
 
         # By default, context is inherited based on the
         # sys.flags.thread_inherit_context option.
@@ -419,6 +470,12 @@ class ContextTest(unittest.TestCase):
         thread = threading.Thread(target=run_context_none, context=None)
         thread.start()
         thread.join()
+
+        if sys.flags.thread_inherit_context:
+            self.assertEqual(results, [(1, 0), (1, 0)])
+        else:
+            warning_count = int(THREAD_INHERIT_CONTEXT_WARNING)
+            self.assertEqual(results, [(None, warning_count)] * 2)
 
         # An explicit Context value can also be passed
         custom_ctx = contextvars.Context()
@@ -446,6 +503,220 @@ class ContextTest(unittest.TestCase):
         thread = threading.Thread(target=run_empty, context=contextvars.Context())
         thread.start()
         thread.join()
+
+    @isolated_context
+    @threading_helper.requires_working_threading()
+    @unittest.skipUnless(THREAD_INHERIT_CONTEXT_WARNING,
+                         "requires the warning-enabled GIL-build default")
+    def test_context_thread_inherit_warning(self):
+        import threading
+
+        call_default = contextvars.ContextVar("call_default")
+        var_default = contextvars.ContextVar("var_default", default="variable")
+        missing = contextvars.ContextVar("missing")
+        other = contextvars.ContextVar("other")
+        for var in (call_default, var_default, missing, other):
+            var.set("starter")
+
+        results = []
+
+        def target():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", DeprecationWarning)
+                # Explicit nested contexts and copies of the child context do
+                # not retain the compatibility metadata.
+                values = [
+                    contextvars.Context().run(call_default.get, "nested"),
+                    contextvars.copy_context().run(call_default.get, "copy"),
+                    call_default.get("argument"),
+                    var_default.get(),
+                ]
+                try:
+                    missing.get()
+                except LookupError:
+                    values.append("LookupError")
+                # The snapshot is detached after the first mismatch, including
+                # for repeated lookups and other variables.
+                values.extend((call_default.get("again"), other.get(None)))
+                results.append((values, caught))
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join()
+
+        values, caught = results[0]
+        self.assertEqual(values, [
+            "nested", "copy", "argument", "variable", "LookupError",
+            "again", None,
+        ])
+        self.assertEqual(len(caught), 1)
+        self.assertIs(caught[0].category, DeprecationWarning)
+        message = str(caught[0].message)
+        self.assertIn(
+            "threads will inherit context by default", message)
+
+    @isolated_context
+    @threading_helper.requires_working_threading()
+    @unittest.skipIf(sys.flags.thread_inherit_context,
+                     "requires the non-inheriting thread default")
+    def test_context_thread_inherit_warning_not_emitted(self):
+        import threading
+
+        unbound = contextvars.ContextVar("unbound")
+        bound = contextvars.ContextVar("bound")
+        bound.set("starter")
+        results = []
+
+        def no_starter_binding():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", DeprecationWarning)
+                results.append((unbound.get(None), len(caught)))
+
+        def child_binding():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", DeprecationWarning)
+                bound.set("child")
+                results.append((bound.get(), len(caught)))
+
+        def explicit_empty():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", DeprecationWarning)
+                results.append((bound.get(None), len(caught)))
+
+        threads = [
+            threading.Thread(target=no_starter_binding),
+            threading.Thread(target=child_binding),
+            threading.Thread(target=explicit_empty,
+                             context=contextvars.Context()),
+        ]
+        for thread in threads:
+            thread.start()
+            thread.join()
+
+        self.assertEqual(results, [(None, 0), ("child", 0), (None, 0)])
+
+    @threading_helper.requires_working_threading()
+    def test_context_thread_inherit_warning_explicitly_disabled(self):
+        code = """
+import contextvars
+import threading
+import warnings
+
+var = contextvars.ContextVar('var')
+var.set('starter')
+result = []
+
+def target():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always', DeprecationWarning)
+        result.append((var.get(None), len(caught)))
+
+thread = threading.Thread(target=target)
+thread.start()
+thread.join()
+assert result == [(None, 0)], result
+"""
+        script_helper.assert_python_ok(
+            "-X", "thread_inherit_context=0", "-c", code)
+        script_helper.assert_python_ok(
+            "-c", code, PYTHON_THREAD_INHERIT_CONTEXT="0")
+
+    @isolated_context
+    @threading_helper.requires_working_threading()
+    @unittest.skipIf(sys.flags.thread_inherit_context,
+                     "requires the non-inheriting thread default")
+    def test_context_thread_warning_snapshot_at_start(self):
+        import threading
+
+        var = contextvars.ContextVar("var")
+        # Keep another variable bound so the starter context is non-empty at
+        # start() and a snapshot is retained.
+        keep = contextvars.ContextVar("keep")
+        keep.set("starter")
+        token = var.set("during construction")
+        results = []
+
+        def target():
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", DeprecationWarning)
+                results.append((var.get(None), len(caught)))
+
+        thread = threading.Thread(target=target)
+        var.reset(token)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(results, [(None, 0)])
+
+    @isolated_context
+    @threading_helper.requires_working_threading()
+    @unittest.skipUnless(THREAD_INHERIT_CONTEXT_WARNING,
+                         "requires the warning-enabled GIL-build default")
+    def test_context_thread_inherit_warning_as_error(self):
+        import threading
+
+        var = contextvars.ContextVar("var")
+        var.set("starter")
+        results = []
+
+        def target():
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                try:
+                    var.get()
+                except DeprecationWarning as exc:
+                    results.append(str(exc))
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(len(results), 1)
+        self.assertIn(
+            "threads will inherit context by default",
+            results[0])
+
+    @threading_helper.requires_working_threading()
+    @unittest.skipIf(support.Py_GIL_DISABLED,
+                     "the free-threaded default inherits context")
+    def test_context_thread_inherit_warning_context_aware(self):
+        code = """
+import contextvars
+import threading
+import warnings
+
+var = contextvars.ContextVar('var')
+var.set('starter')
+result = []
+
+def target():
+    try:
+        var.get()
+    except DeprecationWarning:
+        result.append('warning')
+
+with warnings.catch_warnings():
+    warnings.simplefilter('error', DeprecationWarning)
+    thread = threading.Thread(target=target)
+    thread.start()
+    thread.join()
+
+assert result == ['warning'], result
+"""
+        # An empty value is treated as unset; this shields the subprocess from
+        # any PYTHON_THREAD_INHERIT_CONTEXT in the test environment.
+        script_helper.assert_python_ok(
+            "-W", "error::DeprecationWarning",
+            "-X", "context_aware_warnings=1", "-c", code,
+            PYTHON_THREAD_INHERIT_CONTEXT="")
+
+    def test_private_thread_start_context(self):
+        import _contextvars
+
+        self.assertFalse(hasattr(contextvars, "_thread_start_context"))
+        ctx = _contextvars._thread_start_context()
+        self.assertIs(type(ctx), contextvars.Context)
+        self.assertEqual(ctx.run(lambda: "result"), "result")
 
     def test_token_contextmanager_with_default(self):
         ctx = contextvars.Context()
@@ -585,6 +856,355 @@ class ContextTest(unittest.TestCase):
         ctx1.run(var.set, ReentrantHash())
         ctx2.run(var.set, ReentrantHash())
         ctx1 == ctx2
+
+    def test_context_depth_increases_on_run(self):
+        # Entering a copied context reports a depth one greater than the
+        # context it was copied from; the depth is restored after the run.
+        from _contextvars import _current_context_depth as depth
+        base = depth()
+        got = []
+        contextvars.copy_context().run(lambda: got.append(depth()))
+        self.assertEqual(got, [base + 1])
+        self.assertEqual(depth(), base)
+
+    def test_context_depth_nested_run(self):
+        # Nested copied contexts increase the depth by one per level.
+        from _contextvars import _current_context_depth as depth
+        base = depth()
+        got = []
+
+        def outer():
+            got.append(depth())
+            contextvars.copy_context().run(
+                lambda: got.append(depth()))
+        contextvars.copy_context().run(outer)
+        self.assertEqual(got, [base + 1, base + 2])
+
+    def test_context_depth_reenter_same_context(self):
+        # The depth is fixed when the context is created, so running the
+        # same context object again reports the same depth.
+        from _contextvars import _current_context_depth as depth
+        ctx = contextvars.copy_context()
+        got = []
+        ctx.run(lambda: got.append(depth()))
+        ctx.run(lambda: got.append(depth()))
+        self.assertEqual(got[0], got[1])
+
+    def test_context_depth_copy_method(self):
+        # Context.copy() produces a context one level deeper than its source.
+        from _contextvars import _current_context_depth as depth
+        base = depth()
+        # copy_context() -> depth base+1; .copy() of that -> depth base+2,
+        # regardless of where it is entered (depth is a creation property).
+        ctx = contextvars.copy_context().copy()
+        got = []
+        ctx.run(lambda: got.append(depth()))
+        self.assertEqual(got, [base + 2])
+
+    def test_context_depth_empty_context_is_zero(self):
+        # A freshly created (empty) Context has depth 0 and reports it
+        # independently of the context it is entered from.
+        from _contextvars import _current_context_depth as depth
+        got = []
+        contextvars.Context().run(lambda: got.append(depth()))
+        # Entered from within a deeper context, still its own depth (0).
+        contextvars.copy_context().run(
+            lambda: contextvars.Context().run(
+                lambda: got.append(depth())))
+        self.assertEqual(got, [0, 0])
+
+    def test_context_depth_inherited_value_is_shared(self):
+        # A value set before copying is inherited by the copied context as
+        # the same object, while the depth differs -- this is the signal a
+        # mutable value (e.g. a decimal context) uses to copy for isolation.
+        from _contextvars import _current_context_depth as depth
+        v = contextvars.ContextVar('v')
+        sentinel = object()
+        v.set(sentinel)
+        base = depth()
+        ctx = contextvars.copy_context()
+
+        def check():
+            self.assertEqual(depth(), base + 1)
+            self.assertIs(v.get(), sentinel)
+        ctx.run(check)
+
+    @threading_helper.requires_working_threading()
+    def test_context_depth_with_threads(self):
+        # A thread running a copied context sees a deeper context than the
+        # parent, and each thread's depth is independent.
+        import threading
+        from _contextvars import _current_context_depth as depth
+        base = depth()
+        results = {}
+
+        def thread_func(name):
+            results[name] = depth()
+
+        t1 = threading.Thread(target=contextvars.copy_context().run,
+                              args=(lambda: thread_func('t1'),))
+        t2 = threading.Thread(target=contextvars.copy_context().run,
+                              args=(lambda: thread_func('t2'),))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        self.assertEqual(results['t1'], base + 1)
+        self.assertEqual(results['t2'], base + 1)
+
+
+@threading_helper.requires_working_threading()
+class ThreadInheritableVarTest(unittest.TestCase):
+    # These tests run in a subprocess with -X thread_inherit_context pinned,
+    # since its default depends on the build (true on free-threaded builds).
+
+    def run_with_flag(self, flag, source):
+        _, _, stderr = script_helper.assert_python_ok(
+            '-X', f'thread_inherit_context={flag}', '-c', source)
+        self.assertEqual(stderr, b'')
+
+    def test_thread_inheritance(self):
+        self.run_with_flag(0, """if True:
+            import threading
+            from contextvars import ContextVar, copy_context
+
+            inh = ContextVar.thread_inheritable('inh', default='default')
+            plain = ContextVar('plain')
+            inh.set('inherited')
+            plain.set('not inherited')
+
+            def child():
+                # The binding is a real binding in the thread's context:
+                # visible to get(), copy_context() and Context methods.
+                assert inh.get() == 'inherited'
+                ctx = copy_context()
+                assert inh in ctx
+                assert ctx[inh] == 'inherited'
+                assert ctx.run(inh.get) == 'inherited'
+                # Non-inheritable vars are not visible.
+                assert plain not in ctx
+                try:
+                    plain.get()
+                except LookupError:
+                    pass
+                else:
+                    raise AssertionError('plain was inherited')
+
+            t = threading.Thread(target=child)
+            t.start()
+            t.join()
+            """)
+
+    def test_inheritance_captured_at_start_and_context_copy(self):
+        self.run_with_flag(0, """if True:
+            import threading
+            from contextvars import Context, ContextVar
+
+            inh = ContextVar.thread_inheritable('inh')
+            values = []
+
+            # The binding is captured by start(), not by Thread().
+            t = threading.Thread(target=lambda: values.append(inh.get()))
+            inh.set('at start')
+            t.start()
+            t.join()
+
+            def start_and_join():
+                t = threading.Thread(
+                    target=lambda: values.append(inh.get()))
+                t.start()
+                t.join()
+
+            # Context.run() and Context.copy() preserve the inheritable subset.
+            ctx = Context()
+            ctx.run(inh.set, 'context')
+            ctx.run(start_and_join)
+            ctx_copy = ctx.copy()
+            ctx_copy.run(inh.set, 'copy')
+            ctx_copy.run(start_and_join)
+
+            assert values == ['at start', 'context', 'copy']
+            """)
+
+    def test_thread_start_retry_recaptures_context(self):
+        self.run_with_flag(0, """if True:
+            import threading
+            from contextvars import ContextVar
+
+            inh = ContextVar.thread_inheritable('inh')
+            inh.set('first attempt')
+            values = []
+            t = threading.Thread(target=lambda: values.append(inh.get()))
+
+            start_joinable_thread = threading._start_joinable_thread
+
+            def fail_start(*args, **kwargs):
+                raise threading.ThreadError
+
+            threading._start_joinable_thread = fail_start
+            try:
+                try:
+                    t.start()
+                except threading.ThreadError:
+                    pass
+                else:
+                    raise AssertionError('thread start did not fail')
+            finally:
+                threading._start_joinable_thread = start_joinable_thread
+
+            inh.set('retry')
+            t.start()
+            t.join()
+            assert values == ['retry']
+            """)
+
+    def test_thread_set_and_reset(self):
+        self.run_with_flag(0, """if True:
+            import threading
+            from contextvars import ContextVar
+
+            inh = ContextVar.thread_inheritable('inh')
+            inh.set('inherited')
+
+            def child():
+                token = inh.set('child value')
+                assert inh.get() == 'child value'
+                inh.reset(token)
+                assert inh.get() == 'inherited'
+
+            t = threading.Thread(target=child)
+            t.start()
+            t.join()
+            # The thread's set() does not affect the parent.
+            assert inh.get() == 'inherited'
+            """)
+
+    def test_thread_inheritance_transitive(self):
+        self.run_with_flag(0, """if True:
+            import threading
+            from contextvars import ContextVar
+
+            inh = ContextVar.thread_inheritable('inh')
+            inh.set('inherited')
+
+            def grandchild():
+                assert inh.get() == 'inherited'
+
+            def child():
+                # The child never sets the var; the binding must still
+                # propagate to threads it starts.
+                t = threading.Thread(target=grandchild)
+                t.start()
+                t.join()
+
+            t = threading.Thread(target=child)
+            t.start()
+            t.join()
+            """)
+
+    def test_thread_inheritance_unset_or_deleted(self):
+        self.run_with_flag(0, """if True:
+            import threading
+            from contextvars import ContextVar
+
+            unset = ContextVar.thread_inheritable('unset', default='default')
+            deleted = ContextVar.thread_inheritable('deleted')
+            token = deleted.set('inherited')
+            deleted.reset(token)
+
+            def child():
+                assert unset.get() == 'default'
+                try:
+                    deleted.get()
+                except LookupError:
+                    pass
+                else:
+                    raise AssertionError('deleted binding was inherited')
+
+            t = threading.Thread(target=child)
+            t.start()
+            t.join()
+            """)
+
+    def test_thread_explicit_context(self):
+        self.run_with_flag(0, """if True:
+            import threading
+            from contextvars import ContextVar, Context
+
+            inh = ContextVar.thread_inheritable('inh', default='default')
+            inh.set('inherited')
+
+            def child():
+                assert inh.get() == 'default'
+
+            t = threading.Thread(target=child, context=Context())
+            t.start()
+            t.join()
+            """)
+
+    def test_thread_inheritance_asyncio(self):
+        self.run_with_flag(0, """if True:
+            import asyncio
+            import threading
+            from contextvars import ContextVar
+
+            inh = ContextVar.thread_inheritable('inh')
+            plain = ContextVar('plain')
+            inh.set('inherited')
+            plain.set('not inherited')
+
+            def check_plain_not_set():
+                try:
+                    plain.get()
+                except LookupError:
+                    pass
+                else:
+                    raise AssertionError('plain was inherited')
+
+            async def task():
+                # Tasks run in a copy of the thread's context, which
+                # includes the inherited binding.
+                assert inh.get() == 'inherited'
+                check_plain_not_set()
+                # A set() inside the task is confined to the task.
+                inh.set('task value')
+
+            async def main():
+                assert inh.get() == 'inherited'
+                await asyncio.gather(task(), task())
+                assert inh.get() == 'inherited'
+                # Callbacks also run in a copy of the current context.
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                loop.call_soon(
+                    lambda: fut.set_result((inh.get(), plain.get(None))))
+                assert await fut == ('inherited', None)
+
+            def child():
+                asyncio.run(main())
+
+            t = threading.Thread(target=child)
+            t.start()
+            t.join()
+            """)
+
+    def test_thread_inherit_context_flag_true(self):
+        self.run_with_flag(1, """if True:
+            import threading
+            from contextvars import ContextVar
+
+            inh = ContextVar.thread_inheritable('inh')
+            plain = ContextVar('plain')
+            inh.set('inherited')
+            plain.set('also inherited')
+
+            def child():
+                # With the flag set, the full context is copied.
+                assert inh.get() == 'inherited'
+                assert plain.get() == 'also inherited'
+
+            t = threading.Thread(target=child)
+            t.start()
+            t.join()
+            """)
 
 
 # HAMT Tests
