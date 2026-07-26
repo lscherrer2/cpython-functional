@@ -1,6 +1,7 @@
 import errno
 import itertools
 import os
+import select
 import signal
 import sys
 import threading
@@ -8,6 +9,7 @@ import unittest
 from functools import partial
 from _colorize import ANSIColors
 from test.support import force_color, os_helper, force_not_colorized_test_class
+from test.support import is_android, is_apple_mobile, is_wasm32
 from test.support import threading_helper
 
 from unittest import TestCase
@@ -424,3 +426,101 @@ class TestUnixConsoleEIOHandling(TestCase):
 
         # EIO error should be handled gracefully in restore()
         console.restore()
+
+
+try:
+    import pty
+    import termios as _termios
+except ImportError:
+    pty = None
+
+
+@unittest.skipIf(sys.platform == "win32", "No Unix console on Windows")
+@unittest.skipUnless(pty, "requires pty")
+@unittest.skipIf(is_android or is_apple_mobile or is_wasm32,
+                 "pty is not available on this platform")
+class TestUnixConsoleInputHook(TestCase):
+    # gh-152907: the console must restore cooked output (OPOST) around
+    # input-hook calls, then re-enter raw mode.
+
+    def test_input_hook_output_is_cooked(self):
+        master_fd, slave_fd = pty.openpty()
+
+        # Drain the master continuously: on some platforms (e.g. macOS)
+        # tcsetattr(TCSADRAIN) blocks until the master side is read, so an
+        # undrained pty would deadlock the mode switch.
+        chunks = []
+        reading = True
+
+        def reader():
+            while reading:
+                r, _, _ = select.select([master_fd], [], [], 0.1)
+                if master_fd in r:
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    chunks.append(data)
+
+        reader_thread = threading.Thread(target=reader)
+        reader_thread.start()
+
+        def cleanup():
+            nonlocal reading
+            reading = False
+            reader_thread.join()
+            os.close(master_fd)
+        self.addCleanup(cleanup)
+
+        # Start from a cooked terminal so there are saved flags to restore.
+        attr = _termios.tcgetattr(slave_fd)
+        attr[1] |= _termios.OPOST | _termios.ONLCR
+        _termios.tcsetattr(slave_fd, _termios.TCSANOW, attr)
+
+        console = UnixConsole(slave_fd, slave_fd, term="xterm")
+        console.prepare()
+        try:
+            # pyrepl's own rendering runs with OPOST cleared.
+            self.assertFalse(_termios.tcgetattr(slave_fd)[1] & _termios.OPOST)
+
+            observed = {}
+
+            def fake_hook():
+                observed["oflag"] = _termios.tcgetattr(slave_fd)[1]
+                os.write(slave_fd, b"line1\nline2\n")
+                return 0
+
+            with patch("_pyrepl.unix_console.posix") as mock_posix:
+                mock_posix._is_inputhook_installed.return_value = True
+                mock_posix._inputhook.side_effect = fake_hook
+                hook = console.input_hook
+                self.assertIsNotNone(hook)
+                self.assertEqual(hook(), 0)
+
+            # The hook ran with cooked output (OPOST on)...
+            self.assertTrue(observed["oflag"] & _termios.OPOST)
+            # ...and raw mode was restored afterwards.
+            self.assertFalse(_termios.tcgetattr(slave_fd)[1] & _termios.OPOST)
+        finally:
+            console.restore()
+            os.close(slave_fd)
+
+        # The switch back to raw mode already drained the hook's output, so
+        # joining the reader is enough -- no sleep needed.
+        reading = False
+        reader_thread.join()
+        while select.select([master_fd], [], [], 0)[0]:
+            try:
+                extra = os.read(master_fd, 4096)
+            except OSError:
+                break
+            if not extra:
+                break
+            chunks.append(extra)
+
+        data = b"".join(chunks)
+        # The tty translated the hook's bare '\n' into '\r\n'.
+        self.assertIn(b"line1\r\nline2\r\n", data)
+        self.assertNotIn(b"line1\nline2\n", data)
