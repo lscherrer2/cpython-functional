@@ -97,6 +97,33 @@ static inline BOOL _Py_GetFileInformationByName_ErrorIsTrustworthy(int error)
     return FALSE;
 }
 
+static inline HANDLE _Py_WinCreateFile(
+    _In_ LPCWSTR lpFileName,
+    _In_ DWORD dwDesiredAccess,
+    _In_ DWORD dwShareMode,
+    _In_opt_ LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    _In_ DWORD dwCreationDisposition,
+    _In_ DWORD dwFlagsAndAttributes,
+    _In_opt_ HANDLE hTemplateFile
+)
+{
+#ifndef MS_WINDOWS_DESKTOP
+    if (dwShareMode == 0)
+        dwShareMode = FILE_SHARE_READ;
+
+    CREATEFILE2_EXTENDED_PARAMETERS ext;
+    ZeroMemory(&ext, sizeof(CREATEFILE2_EXTENDED_PARAMETERS));
+    ext.dwSize = sizeof(CREATEFILE2_EXTENDED_PARAMETERS);
+    ext.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    ext.dwFileFlags = dwFlagsAndAttributes & 0xFFFF0000;
+
+    return CreateFile2(lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, &ext);
+#else
+    return CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+                       dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+#endif
+}
+
 #endif
 
 #endif
