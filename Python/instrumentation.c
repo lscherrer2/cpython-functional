@@ -2187,11 +2187,14 @@ monitoring_use_tool_id_impl(PyObject *module, int tool_id, PyObject *name)
         return NULL;
     }
     PyInterpreterState *interp = _PyInterpreterState_GET();
+    PyMutex_Lock(&interp->monitoring_tool_names_mutex);
     if (interp->monitoring_tool_names[tool_id] != NULL) {
         PyErr_Format(PyExc_ValueError, "tool %d is already in use", tool_id);
+        PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
         return NULL;
     }
     interp->monitoring_tool_names[tool_id] = Py_NewRef(name);
+    PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
     Py_RETURN_NONE;
 }
 
@@ -2213,11 +2216,14 @@ monitoring_clear_tool_id_impl(PyObject *module, int tool_id)
 
     PyInterpreterState *interp = _PyInterpreterState_GET();
 
+    PyMutex_Lock(&interp->monitoring_tool_names_mutex);
     if (interp->monitoring_tool_names[tool_id] != NULL) {
         if (_PyMonitoring_ClearToolId(tool_id) < 0) {
+            PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
             return NULL;
         }
     }
+    PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
 
     Py_RETURN_NONE;
 }
@@ -2239,13 +2245,16 @@ monitoring_free_tool_id_impl(PyObject *module, int tool_id)
     }
     PyInterpreterState *interp = _PyInterpreterState_GET();
 
+    PyMutex_Lock(&interp->monitoring_tool_names_mutex);
     if (interp->monitoring_tool_names[tool_id] != NULL) {
         if (_PyMonitoring_ClearToolId(tool_id) < 0) {
+            PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
             return NULL;
         }
     }
 
     Py_CLEAR(interp->monitoring_tool_names[tool_id]);
+    PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
     Py_RETURN_NONE;
 }
 
@@ -2267,11 +2276,15 @@ monitoring_get_tool_impl(PyObject *module, int tool_id)
         return NULL;
     }
     PyInterpreterState *interp = _PyInterpreterState_GET();
+    PyMutex_Lock(&interp->monitoring_tool_names_mutex);
     PyObject *name = interp->monitoring_tool_names[tool_id];
     if (name == NULL) {
+        PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
         Py_RETURN_NONE;
     }
-    return Py_NewRef(name);
+    PyObject *ret = Py_NewRef(name);
+    PyMutex_Unlock(&interp->monitoring_tool_names_mutex);
+    return ret;
 }
 
 /*[clinic input]
