@@ -1173,8 +1173,8 @@ class cached_property:
         if val is _NOT_FOUND:
             val = self.func(instance)
             try:
-                cache[self.attrname] = val
-            except TypeError:
+                val = cache.setdefault(self.attrname, val)
+            except AttributeError:
                 msg = (
                     f"The '__dict__' attribute on {type(instance).__name__!r} instance "
                     f"does not support item assignment for caching {self.attrname!r} property."
