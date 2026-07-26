@@ -1643,6 +1643,7 @@ static PyStructSequence_Field windows_version_fields[] = {
     {"suite_mask", "Bit mask identifying available product suites"},
     {"product_type", "System product type"},
     {"platform_version", "Diagnostic version number"},
+    {"device_family", "Desktop or UWP"},
     {0}
 };
 
@@ -1655,13 +1656,10 @@ static PyStructSequence_Desc windows_version_desc = {
                                       via indexing, the rest are name only */
 };
 
+#ifdef MS_WINDOWS_DESKTOP
 static PyObject *
 _sys_getwindowsversion_from_kernel32(void)
 {
-#ifndef MS_WINDOWS_DESKTOP
-    PyErr_SetString(PyExc_OSError, "cannot read version info on this platform");
-    return NULL;
-#else
     HANDLE hKernel32;
     wchar_t kernel32_path[MAX_PATH];
     LPVOID verblock;
@@ -1698,8 +1696,8 @@ _sys_getwindowsversion_from_kernel32(void)
     realBuild = HIWORD(ffi->dwProductVersionLS);
     PyMem_RawFree(verblock);
     return Py_BuildValue("(kkk)", realMajor, realMinor, realBuild);
-#endif /* !MS_WINDOWS_DESKTOP */
 }
+#endif /* MS_WINDOWS_DESKTOP */
 
 /* Disable deprecation warnings about GetVersionEx as the result is
    being passed straight through to the caller, who is responsible for
@@ -1729,7 +1727,6 @@ sys_getwindowsversion_impl(PyObject *module)
 {
     PyObject *version;
     int pos = 0;
-    OSVERSIONINFOEXW ver;
 
     if (PyObject_GetOptionalAttrString(module, "_cached_windows_version", &version) < 0) {
         return NULL;
@@ -1739,6 +1736,8 @@ sys_getwindowsversion_impl(PyObject *module)
     }
     Py_XDECREF(version);
 
+    OSVERSIONINFOEXW ver;
+    ZeroMemory(&ver, sizeof(ver));
     ver.dwOSVersionInfoSize = sizeof(ver);
     if (!GetVersionExW((OSVERSIONINFOW*) &ver))
         return PyErr_SetFromWindowsErr(0);
@@ -1766,10 +1765,12 @@ sys_getwindowsversion_impl(PyObject *module)
     SET_VERSION_INFO(PyLong_FromLong(ver.wSuiteMask));
     SET_VERSION_INFO(PyLong_FromLong(ver.wProductType));
 
+#ifdef MS_WINDOWS_DESKTOP
     // GetVersion will lie if we are running in a compatibility mode.
     // We need to read the version info from a system file resource
     // to accurately identify the OS version. If we fail for any reason,
     // just return whatever GetVersion said.
+    // UWP return correct version from GetVersionExW, this is not necessary.
     PyObject *realVersion = _sys_getwindowsversion_from_kernel32();
     if (!realVersion) {
         if (!PyErr_ExceptionMatches(PyExc_WindowsError)) {
@@ -1785,6 +1786,11 @@ sys_getwindowsversion_impl(PyObject *module)
     }
 
     SET_VERSION_INFO(realVersion);
+    SET_VERSION_INFO(PyUnicode_FromString("Desktop"));
+#else
+    SET_VERSION_INFO(Py_BuildValue("(kkk)", ver.dwMajorVersion, ver.dwMinorVersion, ver.dwBuildNumber));
+    SET_VERSION_INFO(PyUnicode_FromString("UWP"));
+#endif
 
 #undef SET_VERSION_INFO
 
